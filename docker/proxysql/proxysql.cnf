@@ -1,0 +1,101 @@
+# ─── ADMIN INTERFACE ─────────────────────────────────────
+# This is how you manage ProxySQL itself (not your app)
+datadir="/var/lib/proxysql"
+
+admin_variables=
+{
+  admin_credentials="admin:AdminPass123!"
+  mysql_ifaces="0.0.0.0:6032"
+  refresh_interval=2000
+}
+
+# ─── MYSQL GLOBAL SETTINGS ───────────────────────────────
+mysql_variables=
+{
+  threads=4
+  max_connections=2048
+  default_query_delay=0
+  default_query_timeout=36000000
+  poll_timeout=2000
+  interfaces="0.0.0.0:6033"
+  default_schema="testdb"
+  stacksize=1048576
+  server_version="8.0.0"
+  connect_timeout_server=10000
+  monitor_username="monitor"
+  monitor_password="MonitorPass123!"
+  monitor_connect_interval=2000
+  monitor_ping_interval=2000
+  ping_interval_server_msec=10000
+  ping_timeout_server=200
+  commands_stats=true
+  sessions_sort=true
+}
+
+# ─── BACKEND SERVERS ─────────────────────────────────────
+# hostgroup 10 = PRIMARY  (writes)
+# hostgroup 20 = REPLICAS (reads)
+mysql_servers=
+(
+  {
+    address="mysql-primary"
+    port=3306
+    hostgroup=10
+    status="ONLINE"
+    weight=1000
+    max_connections=200
+  },
+  {
+    address="mysql-replica1"
+    port=3306
+    hostgroup=20
+    status="ONLINE"
+    weight=1000
+    max_connections=200
+  },
+  {
+    address="mysql-replica2"
+    port=3306
+    hostgroup=20
+    status="ONLINE"
+    weight=500
+    max_connections=200
+  }
+)
+
+# ─── APP USERS ────────────────────────────────────────────
+# These are the credentials your app uses to connect
+mysql_users=
+(
+  {
+    username="appuser"
+    password="AppPass123!"
+    default_hostgroup=10
+    active=1
+    max_connections=200
+    default_schema="testdb"
+  }
+)
+
+# ─── QUERY ROUTING RULES ──────────────────────────────────
+# Rule 1: All SELECT queries → replicas  (hostgroup 20)
+# Rule 2: Everything else   → primary   (hostgroup 10)
+mysql_query_rules=
+(
+  {
+    rule_id=1
+    active=1
+    match_pattern="^SELECT"
+    destination_hostgroup=20
+    apply=1
+    comment="Route reads to replicas"
+  },
+  {
+    rule_id=2
+    active=1
+    match_pattern=".*"
+    destination_hostgroup=10
+    apply=1
+    comment="Route writes to primary"
+  }
+)
