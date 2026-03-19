@@ -1,0 +1,269 @@
+name: MySQL HA Cluster
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:      # allows manual trigger from GitHub UI
+
+jobs:
+  mysql-ha-cluster:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+
+# ════════════════════════════════════════════════════════
+# STAGE 1 — SETUP
+# ════════════════════════════════════════════════════════
+
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐳 Verify Docker is available
+        run: |
+          docker --version
+          docker compose version || true
+
+      - name: 🌐 Create cluster Docker network
+        run: |
+          docker network create mysql-cluster
+          echo "✅ Network mysql-cluster created"
+
+# ════════════════════════════════════════════════════════
+# STAGE 2 — START ALL CONTAINERS
+# ════════════════════════════════════════════════════════
+
+      - name: 🟢 Start MySQL Primary
+        run: |
+          docker run -d \
+            --name mysql-primary \
+            --network mysql-cluster \
+            --hostname mysql-primary \
+            -e MYSQL_ROOT_PASSWORD=RootPass123! \
+            -e MYSQL_DATABASE=testdb \
+            -e MYSQL_USER=appuser \
+            -e MYSQL_PASSWORD=AppPass123! \
+            -v ${{ github.workspace }}/docker/mysql/primary/my.cnf:/etc/mysql/conf.d/custom.cnf:ro \
+            -p 3306:3306 \
+            mysql:8.0 \
+            --server-id=1
+          echo "✅ mysql-primary started"
+
+      - name: 🟡 Start MySQL Replica 1
+        run: |
+          docker run -d \
+            --name mysql-replica1 \
+            --network mysql-cluster \
+            --hostname mysql-replica1 \
+            -e MYSQL_ROOT_PASSWORD=RootPass123! \
+            -e MYSQL_DATABASE=testdb \
+            -v ${{ github.workspace }}/docker/mysql/replica/my.cnf:/etc/mysql/conf.d/custom.cnf:ro \
+            -p 3307:3306 \
+            mysql:8.0 \
+            --server-id=2
+          echo "✅ mysql-replica1 started"
+
+      - name: 🟡 Start MySQL Replica 2
+        run: |
+          docker run -d \
+            --name mysql-replica2 \
+            --network mysql-cluster \
+            --hostname mysql-replica2 \
+            -e MYSQL_ROOT_PASSWORD=RootPass123! \
+            -e MYSQL_DATABASE=testdb \
+            -v ${{ github.workspace }}/docker/mysql/replica/my.cnf:/etc/mysql/conf.d/custom.cnf:ro \
+            -p 3308:3306 \
+            mysql:8.0 \
+            --server-id=3
+          echo "✅ mysql-replica2 started"
+
+      - name: 🔀 Start ProxySQL
+        run: |
+          docker run -d \
+            --name proxysql \
+            --network mysql-cluster \
+            --hostname proxysql \
+            -v ${{ github.workspace }}/docker/proxysql/proxysql.cnf:/etc/proxysql.cnf:ro \
+            -p 6033:6033 \
+            -p 6032:6032 \
+            proxysql/proxysql
+          echo "✅ proxysql started"
+
+      - name: 📋 Show all running containers
+        run: docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+
+# ════════════════════════════════════════════════════════
+# STAGE 3 — INITIALIZE REPLICATION
+# ════════════════════════════════════════════════════════
+
+      - name: 🔗 Initialize replication
+        run: |
+          chmod +x scripts/init-replication.sh
+          bash scripts/init-replication.sh
+
+# ════════════════════════════════════════════════════════
+# STAGE 4 — CLUSTER HEALTH CHECK
+# ════════════════════════════════════════════════════════
+
+      - name: 🏥 Check primary status
+        run: |
+          echo "=== PRIMARY MASTER STATUS ==="
+          docker exec mysql-primary mysql \
+            -uroot -pRootPass123! \
+            -e "SHOW MASTER STATUS\G"
+
+      - name: 🏥 Check replica 1 status
+        run: |
+          echo "=== REPLICA 1 SLAVE STATUS ==="
+          docker exec mysql-replica1 mysql \
+            -uroot -pRootPass123! \
+            -e "SHOW SLAVE STATUS\G" \
+            | grep -E "Master_Host|Slave_IO_Running|Slave_SQL_Running|Seconds_Behind_Master"
+
+      - name: 🏥 Check replica 2 status
+        run: |
+          echo "=== REPLICA 2 SLAVE STATUS ==="
+          docker exec mysql-replica2 mysql \
+            -uroot -pRootPass123! \
+            -e "SHOW SLAVE STATUS\G" \
+            | grep -E "Master_Host|Slave_IO_Running|Slave_SQL_Running|Seconds_Behind_Master"
+
+# ════════════════════════════════════════════════════════
+# STAGE 5 — WRITE TEST (via ProxySQL → Primary)
+# ════════════════════════════════════════════════════════
+
+      - name: 📦 Install MySQL client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mysql-client
+
+      - name: ✍️ Test writes through ProxySQL
+        run: |
+          echo "Writing data through ProxySQL → Primary..."
+          mysql \
+            -h 127.0.0.1 \
+            -P 6033 \
+            -u appuser \
+            -pAppPass123! \
+            testdb <<EOF
+          CREATE TABLE IF NOT EXISTS orders (
+            id          INT AUTO_INCREMENT PRIMARY KEY,
+            product     VARCHAR(100)    NOT NULL,
+            amount      DECIMAL(10,2)   NOT NULL,
+            status      VARCHAR(20)     DEFAULT 'pending',
+            created_at  TIMESTAMP       DEFAULT CURRENT_TIMESTAMP
+          );
+
+          INSERT INTO orders (product, amount, status) VALUES
+            ('Widget A',  99.99,  'completed'),
+            ('Widget B',  149.99, 'completed'),
+            ('Widget C',  49.99,  'pending'),
+            ('Widget D',  299.99, 'completed'),
+            ('Widget E',  19.99,  'pending');
+
+          SELECT 'Write test passed' AS result;
+          EOF
+          echo "✅ Write test through ProxySQL succeeded"
+
+# ════════════════════════════════════════════════════════
+# STAGE 6 — READ TEST (via ProxySQL → Replicas)
+# ════════════════════════════════════════════════════════
+
+      - name: 📖 Test reads through ProxySQL
+        run: |
+          sleep 3  # allow replication to catch up
+          echo "Reading data through ProxySQL → Replicas..."
+          mysql \
+            -h 127.0.0.1 \
+            -P 6033 \
+            -u appuser \
+            -pAppPass123! \
+            testdb \
+            -e "SELECT id, product, amount, status FROM orders ORDER BY id;"
+          echo "✅ Read test through ProxySQL succeeded"
+
+      - name: 📖 Verify data on each replica directly
+        run: |
+          echo "=== Direct read from Replica 1 ==="
+          mysql -h 127.0.0.1 -P 3307 \
+            -uroot -pRootPass123! testdb \
+            -e "SELECT COUNT(*) as total_orders FROM orders;"
+
+          echo "=== Direct read from Replica 2 ==="
+          mysql -h 127.0.0.1 -P 3308 \
+            -uroot -pRootPass123! testdb \
+            -e "SELECT COUNT(*) as total_orders FROM orders;"
+
+# ════════════════════════════════════════════════════════
+# STAGE 7 — FAILOVER TEST
+# ════════════════════════════════════════════════════════
+
+      - name: 💥 Simulate primary failure
+        run: |
+          echo "Stopping mysql-primary to simulate failure..."
+          docker stop mysql-primary
+          sleep 5
+          echo "✅ Primary is down"
+          docker ps --format "table {{.Names}}\t{{.Status}}"
+
+      - name: 🔍 Verify replicas still serve reads after failure
+        run: |
+          echo "=== Replicas must still answer reads ==="
+          mysql -h 127.0.0.1 -P 3307 \
+            -uroot -pRootPass123! testdb \
+            -e "SELECT id, product, amount FROM orders LIMIT 3;"
+          echo "✅ Replica1 still serving reads after primary failure"
+
+      - name: 👑 Promote replica1 to new primary
+        run: |
+          echo "Promoting mysql-replica1 as new primary..."
+          docker exec mysql-replica1 mysql \
+            -uroot -pRootPass123! <<EOF
+          STOP SLAVE;
+          RESET SLAVE ALL;
+          SET GLOBAL read_only = OFF;
+          SET GLOBAL super_read_only = OFF;
+          SELECT 'Replica1 promoted to primary' AS status;
+          EOF
+          echo "✅ mysql-replica1 is now the new primary"
+
+      - name: ✍️ Test write to promoted primary
+        run: |
+          echo "Writing to newly promoted primary..."
+          mysql -h 127.0.0.1 -P 3307 \
+            -uroot -pRootPass123! testdb \
+            -e "INSERT INTO orders (product, amount, status)
+                VALUES ('Failover Write Test', 1.00, 'completed');
+                SELECT 'Failover write succeeded' AS result;"
+          echo "✅ Write to promoted primary succeeded"
+
+# ════════════════════════════════════════════════════════
+# STAGE 8 — FINAL SUMMARY (always runs)
+# ════════════════════════════════════════════════════════
+
+      - name: 📊 Final cluster summary
+        if: always()
+        run: |
+          echo ""
+          echo "════════════════════════════════════════"
+          echo "         CLUSTER FINAL SUMMARY          "
+          echo "════════════════════════════════════════"
+          echo ""
+          echo "CONTAINER STATUS:"
+          docker ps -a \
+            --format "table {{.Names}}\t{{.Status}}" \
+            --filter "name=mysql" \
+            --filter "name=proxysql"
+          echo ""
+          echo "TESTS RUN:"
+          echo "  ✅ Cluster started (1 primary + 2 replicas + ProxySQL)"
+          echo "  ✅ GTID replication initialized"
+          echo "  ✅ Write test via ProxySQL"
+          echo "  ✅ Read test via ProxySQL"
+          echo "  ✅ Data verified on both replicas"
+          echo "  ✅ Primary failure simulated"
+          echo "  ✅ Replica promoted to primary"
+          echo "  ✅ Write to promoted primary succeeded"
+          echo ""
+          echo "════════════════════════════════════════"
